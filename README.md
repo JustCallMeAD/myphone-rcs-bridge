@@ -17,6 +17,7 @@ Commands (each with a numeric `id`, answered by `{"id":…, "ok":true|false, …
 | `cmd` | Fields | Reply |
 | --- | --- | --- |
 | `start` | `session` (the JSON from a `session` event, or `null` to pair) | `pairing`: true when a QR code follows |
+| `startGoogle` | `cookies` (Google sign-in cookies: SID, HSID, SSID, APISID, SAPISID, OSID, __Secure-1PSIDTS) | `pairing`: true; an `emoji` event follows, to tap on the phone |
 | `conversations` | `limit` | `conversations`: list |
 | `messages` | `conversationId`, `limit` | `messages`: list, oldest last |
 | `send` | `conversationId`, `text` | |
@@ -25,7 +26,7 @@ Commands (each with a numeric `id`, answered by `{"id":…, "ok":true|false, …
 | `unpair` | | |
 | `stop` | | |
 
-Events: `qr` (`url` to show as a QR code), `paired`, `pairFailed`, `session` (keep it, encrypted, to `start` again later), `connected`, `ready`, `conversation`, `message`, `state`, `disconnected`, `unpaired`.
+Events: `qr` (`url` to show as a QR code), `emoji` (`emoji` to tap on the phone when pairing through the Google account), `paired`, `pairFailed`, `session` (keep it, encrypted, to `start` again later), `connected`, `ready`, `conversation`, `message`, `state`, `disconnected`, `unpaired`.
 
 ## Building
 

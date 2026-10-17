@@ -35,15 +35,16 @@ const Version = "1.0.0"
 
 // Command is one line from My Phone.
 type Command struct {
-	ID             int64           `json:"id"`
-	Cmd            string          `json:"cmd"`
-	Session        json.RawMessage `json:"session,omitempty"`
-	ConversationID string          `json:"conversationId,omitempty"`
-	MessageID      string          `json:"messageId,omitempty"`
-	Text           string          `json:"text,omitempty"`
-	Limit          int64           `json:"limit,omitempty"`
-	MediaID        string          `json:"mediaId,omitempty"`
-	Key            string          `json:"key,omitempty"`
+	ID             int64             `json:"id"`
+	Cmd            string            `json:"cmd"`
+	Session        json.RawMessage   `json:"session,omitempty"`
+	ConversationID string            `json:"conversationId,omitempty"`
+	MessageID      string            `json:"messageId,omitempty"`
+	Text           string            `json:"text,omitempty"`
+	Limit          int64             `json:"limit,omitempty"`
+	MediaID        string            `json:"mediaId,omitempty"`
+	Cookies        map[string]string `json:"cookies,omitempty"`
+	Key            string            `json:"key,omitempty"`
 }
 
 // Participant is a person in a conversation.
@@ -168,7 +169,7 @@ func (b *bridge) start(cmd Command) {
 			return
 		}
 	}
-	if auth == nil || auth.Browser == nil {
+	if auth == nil || (auth.Browser == nil && !auth.IsGoogleAccount()) {
 		reply(cmd.ID, map[string]any{"pairing": true})
 		go b.pair()
 		return
@@ -194,6 +195,65 @@ func (b *bridge) connect(cli *libgm.Client) {
 	default:
 		event("disconnected", map[string]any{"reason": "Could not reach Google Messages: " + err.Error()})
 	}
+}
+
+// pairGoogle pairs through the Google account the phone's Google Messages uses (phones that offer
+// no QR code scanner): the cookies come from signing in to Google on the PC, then the phone asks the
+// person to tap the emoji shown here.
+func (b *bridge) pairGoogle(cmd Command) {
+	if len(cmd.Cookies) == 0 {
+		fail(cmd.ID, "no_cookies", errors.New("Sign in to Google first."))
+		return
+	}
+	reply(cmd.ID, map[string]any{"pairing": true})
+	go func() {
+		auth := libgm.NewAuthData()
+		auth.SetCookies(cmd.Cookies)
+		cli := b.newClient(auth)
+		b.mu.Lock()
+		b.client = cli
+		b.mu.Unlock()
+		if err := cli.FetchConfig(b.ctx); err != nil {
+			event("pairFailed", map[string]any{"reason": "Could not reach Google Messages with that Google sign-in: " + err.Error()})
+			return
+		}
+		emoji, session, err := cli.StartGaiaPairing(b.ctx, b.ctx)
+		if err != nil {
+			reason := "Could not start pairing: " + err.Error()
+			switch {
+			case errors.Is(err, libgm.ErrNoDevicesFound):
+				reason = "No phone with Google Messages was found on that Google account. Sign in with the account the phone uses."
+			case errors.Is(err, libgm.ErrPairingInitTimeout):
+				reason = "The phone did not answer. Make sure it is online and Google Messages is up to date."
+			}
+			cli.Disconnect()
+			event("pairFailed", map[string]any{"reason": reason})
+			return
+		}
+		event("emoji", map[string]any{"emoji": emoji, "url": libgm.GetEmojiSVG(emoji)})
+		if _, err := cli.FinishGaiaPairing(b.ctx, session); err != nil {
+			reason := "Pairing did not finish: " + err.Error()
+			switch {
+			case errors.Is(err, libgm.ErrIncorrectEmoji):
+				reason = "A different emoji was tapped on the phone."
+			case errors.Is(err, libgm.ErrPairingCancelled):
+				reason = "Pairing was cancelled on the phone."
+			case errors.Is(err, libgm.ErrPairingTimeout):
+				reason = "No emoji was tapped on the phone in time."
+			}
+			cli.Disconnect()
+			event("pairFailed", map[string]any{"reason": reason})
+			return
+		}
+		cli.Disconnect()
+		b.sendSession(cli)
+		event("paired", nil)
+		b.mu.Lock()
+		b.client = b.newClient(cli.AuthData)
+		next := b.client
+		b.mu.Unlock()
+		b.connect(next)
+	}()
 }
 
 // pair shows QR codes until the phone scans one (a new code every 30 seconds, for about 3 minutes).
@@ -554,6 +614,8 @@ func main() {
 		switch cmd.Cmd {
 		case "start":
 			b.start(cmd)
+		case "startGoogle":
+			b.pairGoogle(cmd)
 		case "conversations":
 			go b.conversations(cmd)
 		case "messages":
