@@ -1,0 +1,585 @@
+// myphone-rcs-bridge connects My Phone (a Windows app) to Google Messages the way Google Messages
+// for web does, so RCS chats can be read and answered from the PC. It is a small helper program:
+// My Phone starts it, talks to it through standard input and output (one JSON object per line),
+// and keeps the pairing itself. It uses libgm from mautrix-gmessages and is licensed, like it,
+// under the GNU Affero General Public License v3.0 or later (see LICENSE).
+//
+// Nothing a message says, and no phone number or name, is ever written to the log (standard error).
+package main
+
+import (
+	"bufio"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/rs/zerolog"
+	"go.mau.fi/util/exhttp"
+
+	"go.mau.fi/mautrix-gmessages/pkg/libgm"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/events"
+	"go.mau.fi/mautrix-gmessages/pkg/libgm/gmproto"
+)
+
+// Version is reported to My Phone in the "ready" event.
+const Version = "1.0.0"
+
+// ---------------------------------------------------------------- Wire format
+
+// Command is one line from My Phone.
+type Command struct {
+	ID             int64           `json:"id"`
+	Cmd            string          `json:"cmd"`
+	Session        json.RawMessage `json:"session,omitempty"`
+	ConversationID string          `json:"conversationId,omitempty"`
+	MessageID      string          `json:"messageId,omitempty"`
+	Text           string          `json:"text,omitempty"`
+	Limit          int64           `json:"limit,omitempty"`
+	MediaID        string          `json:"mediaId,omitempty"`
+	Key            string          `json:"key,omitempty"`
+}
+
+// Participant is a person in a conversation.
+type Participant struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Number string `json:"number"`
+	IsMe   bool   `json:"isMe"`
+}
+
+// Conversation is one conversation in Google Messages.
+type Conversation struct {
+	ID            string        `json:"id"`
+	Name          string        `json:"name"`
+	IsRCS         bool          `json:"isRcs"`
+	IsGroup       bool          `json:"isGroup"`
+	Unread        bool          `json:"unread"`
+	LastMs        int64         `json:"lastMs"`
+	Snippet       string        `json:"snippet"`
+	SnippetFromMe bool          `json:"snippetFromMe"`
+	ReadOnly      bool          `json:"readOnly"`
+	Participants  []Participant `json:"participants"`
+}
+
+// Media is a picture, video or file in a message.
+type Media struct {
+	MediaID string `json:"mediaId"`
+	Key     string `json:"key"`
+	Mime    string `json:"mime"`
+	Name    string `json:"name"`
+	Size    int64  `json:"size"`
+}
+
+// Message is one message.
+type Message struct {
+	ID             string  `json:"id"`
+	ConversationID string  `json:"conversationId"`
+	SenderName     string  `json:"senderName"`
+	FromMe         bool    `json:"fromMe"`
+	TimeMs         int64   `json:"timeMs"`
+	Text           string  `json:"text"`
+	Status         string  `json:"status"`
+	Media          []Media `json:"media,omitempty"`
+}
+
+// ---------------------------------------------------------------- Output
+
+var out = struct {
+	sync.Mutex
+	w *bufio.Writer
+}{w: bufio.NewWriter(os.Stdout)}
+
+func send(v map[string]any) {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	out.Lock()
+	defer out.Unlock()
+	out.w.Write(data)
+	out.w.WriteByte('\n')
+	out.w.Flush()
+}
+
+func event(name string, fields map[string]any) {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields["event"] = name
+	send(fields)
+}
+
+func reply(id int64, fields map[string]any) {
+	if fields == nil {
+		fields = map[string]any{}
+	}
+	fields["id"] = id
+	fields["ok"] = true
+	send(fields)
+}
+
+func fail(id int64, code string, err error) {
+	message := code
+	if err != nil {
+		message = err.Error()
+	}
+	send(map[string]any{"id": id, "ok": false, "code": code, "message": message})
+}
+
+// ---------------------------------------------------------------- Bridge
+
+type bridge struct {
+	log    zerolog.Logger
+	ctx    context.Context
+	cancel context.CancelFunc
+
+	mu     sync.Mutex
+	client *libgm.Client
+	sims   map[string]*gmproto.SIMCard // by the SIM's own participant id
+	convs  map[string]*gmproto.Conversation
+	paired chan *gmproto.PairedData
+}
+
+func newBridge(log zerolog.Logger) *bridge {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &bridge{log: log, ctx: ctx, cancel: cancel, sims: map[string]*gmproto.SIMCard{}, convs: map[string]*gmproto.Conversation{}}
+}
+
+func (b *bridge) newClient(auth *libgm.AuthData) *libgm.Client {
+	cli := libgm.NewClient(auth, nil, b.log.With().Str("component", "libgm").Logger(), exhttp.SensibleClientSettings)
+	cli.SetEventHandler(b.onEvent)
+	return cli
+}
+
+// start connects with a stored session, or pairs anew (QR codes) when there is none.
+func (b *bridge) start(cmd Command) {
+	var auth *libgm.AuthData
+	if len(cmd.Session) > 0 && string(cmd.Session) != "null" {
+		auth = libgm.NewAuthData()
+		if err := json.Unmarshal(cmd.Session, auth); err != nil {
+			fail(cmd.ID, "bad_session", err)
+			return
+		}
+	}
+	if auth == nil || auth.Browser == nil {
+		reply(cmd.ID, map[string]any{"pairing": true})
+		go b.pair()
+		return
+	}
+	b.mu.Lock()
+	b.client = b.newClient(auth)
+	cli := b.client
+	b.mu.Unlock()
+	reply(cmd.ID, map[string]any{"pairing": false})
+	go b.connect(cli)
+}
+
+func (b *bridge) connect(cli *libgm.Client) {
+	if err := cli.FetchConfig(b.ctx); err != nil {
+		b.log.Warn().Err(err).Msg("config fetch failed")
+	}
+	err := cli.Connect(b.ctx)
+	switch {
+	case err == nil:
+		event("connected", nil)
+	case errors.Is(err, events.ErrRequestedEntityNotFound), errors.Is(err, events.ErrInvalidCredentials):
+		event("unpaired", map[string]any{"reason": "Google Messages no longer knows this PC. Pair again."})
+	default:
+		event("disconnected", map[string]any{"reason": "Could not reach Google Messages: " + err.Error()})
+	}
+}
+
+// pair shows QR codes until the phone scans one (a new code every 30 seconds, for about 3 minutes).
+func (b *bridge) pair() {
+	cli := b.newClient(libgm.NewAuthData())
+	b.mu.Lock()
+	b.client = cli
+	b.paired = make(chan *gmproto.PairedData, 1)
+	paired := b.paired
+	b.mu.Unlock()
+	callback := func(data *gmproto.PairedData) { paired <- data }
+	cli.PairCallback.Store(&callback)
+	if err := cli.FetchConfig(b.ctx); err != nil {
+		event("pairFailed", map[string]any{"reason": "Could not reach Google Messages: " + err.Error()})
+		return
+	}
+	qr, err := cli.StartLogin(b.ctx)
+	if err != nil {
+		event("pairFailed", map[string]any{"reason": "Could not start pairing: " + err.Error()})
+		return
+	}
+	event("qr", map[string]any{"url": qr})
+	for attempt := 0; attempt < 6; attempt++ {
+		select {
+		case <-paired:
+			// Give the phone a moment to save the pairing before connecting again.
+			time.Sleep(2 * time.Second)
+			cli.Disconnect()
+			b.sendSession(cli)
+			event("paired", nil)
+			b.mu.Lock()
+			b.client = b.newClient(cli.AuthData)
+			next := b.client
+			b.mu.Unlock()
+			b.connect(next)
+			return
+		case <-time.After(30 * time.Second):
+			next, err := cli.RefreshPhoneRelay()
+			if err != nil {
+				event("pairFailed", map[string]any{"reason": "Could not make a new code: " + err.Error()})
+				cli.Disconnect()
+				return
+			}
+			event("qr", map[string]any{"url": next})
+		case <-b.ctx.Done():
+			return
+		}
+	}
+	cli.Disconnect()
+	event("pairFailed", map[string]any{"reason": "No code was scanned in time."})
+}
+
+func (b *bridge) sendSession(cli *libgm.Client) {
+	data, err := json.Marshal(cli.AuthData)
+	if err == nil {
+		event("session", map[string]any{"session": json.RawMessage(data)})
+	}
+}
+
+func (b *bridge) current() *libgm.Client {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.client
+}
+
+func (b *bridge) onEvent(raw any) {
+	switch evt := raw.(type) {
+	case *events.ClientReady:
+		b.mu.Lock()
+		for _, c := range evt.Conversations {
+			b.convs[c.GetConversationID()] = c
+		}
+		b.mu.Unlock()
+		event("ready", map[string]any{"version": Version})
+	case *gmproto.Conversation:
+		b.mu.Lock()
+		b.convs[evt.GetConversationID()] = evt
+		b.mu.Unlock()
+		event("conversation", map[string]any{"conversation": convertConversation(evt)})
+	case *libgm.WrappedMessage:
+		if evt.IsOld {
+			return
+		}
+		event("message", map[string]any{"message": convertMessage(evt.Message)})
+	case *gmproto.Settings:
+		b.mu.Lock()
+		for _, sim := range evt.GetSIMCards() {
+			b.sims[sim.GetSIMParticipant().GetID()] = sim
+		}
+		b.mu.Unlock()
+	case *events.AuthTokenRefreshed:
+		if cli := b.current(); cli != nil {
+			b.sendSession(cli)
+		}
+	case *gmproto.RevokePairData:
+		event("unpaired", map[string]any{"reason": "This PC was unpaired in Google Messages."})
+	case *events.GaiaLoggedOut:
+		event("unpaired", map[string]any{"reason": "Signed out of Google Messages."})
+	case *events.ListenFatalError:
+		event("disconnected", map[string]any{"reason": "The connection to Google Messages stopped. It will try again."})
+	case *events.ListenTemporaryError:
+		event("state", map[string]any{"state": "retrying"})
+	case *events.ListenRecovered:
+		event("state", map[string]any{"state": "connected"})
+	case *events.PhoneNotResponding:
+		event("state", map[string]any{"state": "phoneNotResponding"})
+	case *events.PhoneRespondingAgain:
+		event("state", map[string]any{"state": "connected"})
+	case *events.BrowserActive:
+		// Google Messages is open in a browser somewhere: only one web session is active at a time.
+		event("state", map[string]any{"state": "otherSessionActive"})
+	}
+}
+
+// ---------------------------------------------------------------- Requests
+
+func (b *bridge) conversations(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	limit := cmd.Limit
+	if limit <= 0 {
+		limit = 75
+	}
+	resp, err := cli.ListConversations(b.ctx, &gmproto.ListConversationsRequest{Count: limit, Folder: gmproto.ListConversationsRequest_INBOX})
+	if err != nil {
+		fail(cmd.ID, "request_failed", err)
+		return
+	}
+	list := make([]Conversation, 0, len(resp.GetConversations()))
+	b.mu.Lock()
+	for _, c := range resp.GetConversations() {
+		b.convs[c.GetConversationID()] = c
+		list = append(list, convertConversation(c))
+	}
+	b.mu.Unlock()
+	reply(cmd.ID, map[string]any{"conversations": list})
+}
+
+func (b *bridge) messages(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	limit := cmd.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	resp, err := cli.FetchMessages(b.ctx, cmd.ConversationID, limit, nil)
+	if err != nil {
+		fail(cmd.ID, "request_failed", err)
+		return
+	}
+	list := make([]Message, 0, len(resp.GetMessages()))
+	for _, m := range resp.GetMessages() {
+		list = append(list, convertMessage(m))
+	}
+	reply(cmd.ID, map[string]any{"messages": list})
+}
+
+func (b *bridge) sendText(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	b.mu.Lock()
+	conv := b.convs[cmd.ConversationID]
+	b.mu.Unlock()
+	if conv == nil {
+		got, err := cli.GetConversation(b.ctx, cmd.ConversationID)
+		if err != nil {
+			fail(cmd.ID, "no_conversation", err)
+			return
+		}
+		conv = got
+	}
+	outgoing := conv.GetDefaultOutgoingID()
+	b.mu.Lock()
+	sim := b.sims[outgoing]
+	b.mu.Unlock()
+	tmp := fmt.Sprintf("myphone-%d", time.Now().UnixNano())
+	req := &gmproto.SendMessageRequest{
+		ConversationID: cmd.ConversationID,
+		MessagePayload: &gmproto.MessagePayload{
+			TmpID:          tmp,
+			ConversationID: cmd.ConversationID,
+			ParticipantID:  outgoing,
+			TmpID2:         tmp,
+			MessageInfo: []*gmproto.MessageInfo{{
+				Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: cmd.Text}},
+			}},
+		},
+		SIMPayload: sim.GetSIMData().GetSIMPayload(),
+		TmpID:      tmp,
+	}
+	resp, err := cli.SendMessage(b.ctx, req)
+	if err != nil {
+		fail(cmd.ID, "send_failed", err)
+		return
+	}
+	if resp.GetStatus() != gmproto.SendMessageResponse_SUCCESS {
+		fail(cmd.ID, "send_failed", fmt.Errorf("Google Messages did not take the message (%s)", resp.GetStatus().String()))
+		return
+	}
+	reply(cmd.ID, nil)
+}
+
+func (b *bridge) markRead(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	if err := cli.MarkRead(b.ctx, cmd.ConversationID, cmd.MessageID); err != nil {
+		fail(cmd.ID, "request_failed", err)
+		return
+	}
+	reply(cmd.ID, nil)
+}
+
+func (b *bridge) media(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	key, err := base64.StdEncoding.DecodeString(cmd.Key)
+	if err != nil {
+		fail(cmd.ID, "bad_key", err)
+		return
+	}
+	body, err := cli.DownloadMedia(cmd.MediaID, key)
+	if err != nil {
+		fail(cmd.ID, "download_failed", err)
+		return
+	}
+	defer body.Close()
+	data, err := io.ReadAll(io.LimitReader(body, 100<<20))
+	if err != nil {
+		fail(cmd.ID, "download_failed", err)
+		return
+	}
+	reply(cmd.ID, map[string]any{"data": base64.StdEncoding.EncodeToString(data)})
+}
+
+func (b *bridge) unpair(cmd Command) {
+	if cli := b.current(); cli != nil {
+		if err := cli.Unpair(b.ctx); err != nil {
+			b.log.Warn().Err(err).Msg("unpair failed")
+		}
+		cli.Disconnect()
+	}
+	b.mu.Lock()
+	b.client = nil
+	b.mu.Unlock()
+	reply(cmd.ID, nil)
+}
+
+// ---------------------------------------------------------------- Conversion
+
+func convertConversation(c *gmproto.Conversation) Conversation {
+	people := make([]Participant, 0, len(c.GetParticipants()))
+	for _, p := range c.GetParticipants() {
+		people = append(people, Participant{
+			ID:     p.GetID().GetParticipantID(),
+			Name:   p.GetFullName(),
+			Number: p.GetID().GetNumber(),
+			IsMe:   p.GetIsMe(),
+		})
+	}
+	latest := c.GetLatestMessage()
+	return Conversation{
+		ID:            c.GetConversationID(),
+		Name:          c.GetName(),
+		IsRCS:         c.GetType() == gmproto.ConversationType_RCS,
+		IsGroup:       c.GetIsGroupChat(),
+		Unread:        c.GetUnread(),
+		LastMs:        c.GetLastMessageTimestamp() / 1000,
+		Snippet:       latest.GetDisplayContent(),
+		SnippetFromMe: latest.GetFromMe() == 1,
+		ReadOnly:      c.GetReadOnly(),
+		Participants:  people,
+	}
+}
+
+func convertMessage(m *gmproto.Message) Message {
+	var text []string
+	var media []Media
+	for _, info := range m.GetMessageInfo() {
+		if content := info.GetMessageContent(); content != nil && content.GetContent() != "" {
+			text = append(text, content.GetContent())
+		}
+		if mc := info.GetMediaContent(); mc != nil {
+			media = append(media, Media{
+				MediaID: mc.GetMediaID(),
+				Key:     base64.StdEncoding.EncodeToString(mc.GetDecryptionKey()),
+				Mime:    mc.GetMimeType(),
+				Name:    mc.GetMediaName(),
+				Size:    mc.GetSize(),
+			})
+		}
+	}
+	status := m.GetMessageStatus().GetStatus()
+	return Message{
+		ID:             m.GetMessageID(),
+		ConversationID: m.GetConversationID(),
+		SenderName:     m.GetSenderParticipant().GetFullName(),
+		FromMe:         status < 100,
+		TimeMs:         m.GetTimestamp() / 1000,
+		Text:           strings.Join(text, "\n"),
+		Status:         statusName(status),
+		Media:          media,
+	}
+}
+
+func statusName(s gmproto.MessageStatusType) string {
+	switch s {
+	case gmproto.MessageStatusType_OUTGOING_DELIVERED:
+		return "delivered"
+	case gmproto.MessageStatusType_OUTGOING_DISPLAYED:
+		return "read"
+	case gmproto.MessageStatusType_OUTGOING_COMPLETE:
+		return "sent"
+	case gmproto.MessageStatusType_OUTGOING_SENDING, gmproto.MessageStatusType_OUTGOING_YET_TO_SEND,
+		gmproto.MessageStatusType_OUTGOING_RESENDING, gmproto.MessageStatusType_OUTGOING_VALIDATING,
+		gmproto.MessageStatusType_OUTGOING_SEND_AFTER_PROCESSING, gmproto.MessageStatusType_OUTGOING_AWAITING_RETRY:
+		return "sending"
+	}
+	if s >= gmproto.MessageStatusType_OUTGOING_FAILED_GENERIC && s < 100 && s != gmproto.MessageStatusType_OUTGOING_DRAFT &&
+		s != gmproto.MessageStatusType_OUTGOING_SCHEDULED && s != gmproto.MessageStatusType_OUTGOING_NOT_DELIVERED_YET {
+		return "failed"
+	}
+	return ""
+}
+
+// ---------------------------------------------------------------- Main loop
+
+func main() {
+	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
+		fmt.Println("myphone-rcs-bridge", Version)
+		return
+	}
+	// Warnings only, and never message content: libgm logs content only at trace level.
+	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, NoColor: true}).Level(zerolog.WarnLevel).With().Timestamp().Logger()
+	b := newBridge(log)
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Buffer(make([]byte, 1<<20), 16<<20)
+	for scanner.Scan() {
+		var cmd Command
+		if err := json.Unmarshal(scanner.Bytes(), &cmd); err != nil {
+			fail(0, "bad_command", err)
+			continue
+		}
+		switch cmd.Cmd {
+		case "start":
+			b.start(cmd)
+		case "conversations":
+			go b.conversations(cmd)
+		case "messages":
+			go b.messages(cmd)
+		case "send":
+			go b.sendText(cmd)
+		case "markRead":
+			go b.markRead(cmd)
+		case "media":
+			go b.media(cmd)
+		case "unpair":
+			b.unpair(cmd)
+		case "stop":
+			reply(cmd.ID, nil)
+			if cli := b.current(); cli != nil {
+				cli.Disconnect()
+			}
+			b.cancel()
+			return
+		default:
+			fail(cmd.ID, "unknown_command", nil)
+		}
+	}
+	// My Phone closed: stop too.
+	if cli := b.current(); cli != nil {
+		cli.Disconnect()
+	}
+	b.cancel()
+}
