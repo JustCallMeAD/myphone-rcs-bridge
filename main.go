@@ -44,6 +44,7 @@ type Command struct {
 	Limit          int64             `json:"limit,omitempty"`
 	MediaID        string            `json:"mediaId,omitempty"`
 	Cookies        map[string]string `json:"cookies,omitempty"`
+	Device         int               `json:"device,omitempty"`
 	Key            string            `json:"key,omitempty"`
 }
 
@@ -107,6 +108,11 @@ func send(v map[string]any) {
 	out.w.Write(data)
 	out.w.WriteByte('\n')
 	out.w.Flush()
+}
+
+// progress tells My Phone (for its log) where a long step has got to. Never personal data.
+func progress(text string) {
+	event("log", map[string]any{"text": text})
 }
 
 func event(name string, fields map[string]any) {
@@ -210,6 +216,8 @@ func (b *bridge) pairGoogle(cmd Command) {
 		auth := libgm.NewAuthData()
 		auth.SetCookies(cmd.Cookies)
 		cli := b.newClient(auth)
+		// Several phones on one Google account: each try asks the next one (My Phone counts the tries).
+		cli.GaiaHackyDeviceSwitcher = cmd.Device
 		b.mu.Lock()
 		b.client = cli
 		b.mu.Unlock()
@@ -217,6 +225,7 @@ func (b *bridge) pairGoogle(cmd Command) {
 			event("pairFailed", map[string]any{"reason": "Could not reach Google Messages with that Google sign-in: " + err.Error()})
 			return
 		}
+		progress("google pairing: asking the phone")
 		emoji, session, err := cli.StartGaiaPairing(b.ctx, b.ctx)
 		if err != nil {
 			reason := "Could not start pairing: " + err.Error()
@@ -231,7 +240,17 @@ func (b *bridge) pairGoogle(cmd Command) {
 			return
 		}
 		event("emoji", map[string]any{"emoji": emoji, "url": libgm.GetEmojiSVG(emoji)})
-		if _, err := cli.FinishGaiaPairing(b.ctx, session); err != nil {
+		progress("google pairing: emoji shown, waiting for the phone")
+		// The phone has a few minutes to answer; after that, say so rather than wait for ever.
+		finishCtx, cancel := context.WithTimeout(b.ctx, 4*time.Minute)
+		_, err = cli.FinishGaiaPairing(finishCtx, session)
+		cancel()
+		if errors.Is(err, context.DeadlineExceeded) {
+			cli.Disconnect()
+			event("pairFailed", map[string]any{"reason": "The phone did not confirm in time.", "timeout": true})
+			return
+		}
+		if err != nil {
 			reason := "Pairing did not finish: " + err.Error()
 			switch {
 			case errors.Is(err, libgm.ErrIncorrectEmoji):
@@ -245,6 +264,7 @@ func (b *bridge) pairGoogle(cmd Command) {
 			event("pairFailed", map[string]any{"reason": reason})
 			return
 		}
+		progress("google pairing: confirmed")
 		cli.Disconnect()
 		b.sendSession(cli)
 		event("paired", nil)
@@ -525,7 +545,7 @@ func convertConversation(c *gmproto.Conversation) Conversation {
 			ID:     p.GetID().GetParticipantID(),
 			Name:   p.GetFullName(),
 			Number: p.GetID().GetNumber(),
-			IsMe:   p.GetIsMe(),
+			IsMe:   p.GetIsMe() || p.GetID().GetParticipantID() == c.GetDefaultOutgoingID(),
 		})
 	}
 	latest := c.GetLatestMessage()
