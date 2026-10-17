@@ -46,6 +46,18 @@ type Command struct {
 	Cookies        map[string]string `json:"cookies,omitempty"`
 	Device         int               `json:"device,omitempty"`
 	Key            string            `json:"key,omitempty"`
+	Data           string            `json:"data,omitempty"`      // base64, for sendMedia
+	Name           string            `json:"name,omitempty"`      // file name, for sendMedia
+	Mime           string            `json:"mime,omitempty"`      // for sendMedia
+	Emoji          string            `json:"emoji,omitempty"`     // for react
+	Remove         bool              `json:"remove,omitempty"`    // react: take the reaction off
+	ReplyTo        string            `json:"replyTo,omitempty"`   // send: the message answered
+	SIM            string            `json:"sim,omitempty"`       // send: the SIM's participant id
+	Numbers        []string          `json:"numbers,omitempty"`   // newChat
+	GroupName      string            `json:"groupName,omitempty"` // newChat, several numbers
+	Typing         bool              `json:"typing,omitempty"`    // setTyping
+	Archive        bool              `json:"archive,omitempty"`   // archive: false brings it back
+	Phone          string            `json:"phone,omitempty"`     // deleteConversation
 }
 
 // Participant is a person in a conversation.
@@ -68,6 +80,22 @@ type Conversation struct {
 	SnippetFromMe bool          `json:"snippetFromMe"`
 	ReadOnly      bool          `json:"readOnly"`
 	Participants  []Participant `json:"participants"`
+	// The SIM (its participant id) Google Messages sends from in this conversation.
+	DefaultSIM string `json:"defaultSim"`
+}
+
+// Reaction is one emoji on a message, with how many people chose it.
+type Reaction struct {
+	Emoji string `json:"emoji"`
+	Count int    `json:"count"`
+	Mine  bool   `json:"mine"`
+}
+
+// SIM is one of the phone's SIM cards.
+type SIM struct {
+	ID      string `json:"id"`
+	Carrier string `json:"carrier"`
+	Number  string `json:"number"`
 }
 
 // Media is a picture, video or file in a message.
@@ -81,14 +109,16 @@ type Media struct {
 
 // Message is one message.
 type Message struct {
-	ID             string  `json:"id"`
-	ConversationID string  `json:"conversationId"`
-	SenderName     string  `json:"senderName"`
-	FromMe         bool    `json:"fromMe"`
-	TimeMs         int64   `json:"timeMs"`
-	Text           string  `json:"text"`
-	Status         string  `json:"status"`
-	Media          []Media `json:"media,omitempty"`
+	ID             string     `json:"id"`
+	ConversationID string     `json:"conversationId"`
+	SenderName     string     `json:"senderName"`
+	FromMe         bool       `json:"fromMe"`
+	TimeMs         int64      `json:"timeMs"`
+	Text           string     `json:"text"`
+	Status         string     `json:"status"`
+	Media          []Media    `json:"media,omitempty"`
+	Reactions      []Reaction `json:"reactions,omitempty"`
+	ReplyTo        string     `json:"replyTo,omitempty"`
 }
 
 // ---------------------------------------------------------------- Output
@@ -151,12 +181,13 @@ type bridge struct {
 	client *libgm.Client
 	sims   map[string]*gmproto.SIMCard // by the SIM's own participant id
 	convs  map[string]*gmproto.Conversation
+	self   map[string]bool // this phone's own participant ids (its SIMs)
 	paired chan *gmproto.PairedData
 }
 
 func newBridge(log zerolog.Logger) *bridge {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &bridge{log: log, ctx: ctx, cancel: cancel, sims: map[string]*gmproto.SIMCard{}, convs: map[string]*gmproto.Conversation{}}
+	return &bridge{log: log, ctx: ctx, cancel: cancel, sims: map[string]*gmproto.SIMCard{}, convs: map[string]*gmproto.Conversation{}, self: map[string]bool{}}
 }
 
 func (b *bridge) newClient(auth *libgm.AuthData) *libgm.Client {
@@ -357,11 +388,12 @@ func (b *bridge) onEvent(raw any) {
 		if evt.IsOld {
 			return
 		}
-		event("message", map[string]any{"message": convertMessage(evt.Message)})
+		event("message", map[string]any{"message": b.convertMessage(evt.Message)})
 	case *gmproto.Settings:
 		b.mu.Lock()
 		for _, sim := range evt.GetSIMCards() {
 			b.sims[sim.GetSIMParticipant().GetID()] = sim
+			b.self[sim.GetSIMParticipant().GetID()] = true
 		}
 		b.mu.Unlock()
 	case *events.AuthTokenRefreshed:
@@ -382,6 +414,12 @@ func (b *bridge) onEvent(raw any) {
 		event("state", map[string]any{"state": "phoneNotResponding"})
 	case *events.PhoneRespondingAgain:
 		event("state", map[string]any{"state": "connected"})
+	case *gmproto.TypingData:
+		event("typing", map[string]any{
+			"conversationId": evt.GetConversationID(),
+			"number":         evt.GetUser().GetNumber(),
+			"typing":         evt.GetType() == gmproto.TypingTypes_STARTED_TYPING,
+		})
 	case *events.BrowserActive:
 		// Google Messages is open in a browser somewhere: only one web session is active at a time.
 		event("state", map[string]any{"state": "otherSessionActive"})
@@ -432,12 +470,42 @@ func (b *bridge) messages(cmd Command) {
 	}
 	list := make([]Message, 0, len(resp.GetMessages()))
 	for _, m := range resp.GetMessages() {
-		list = append(list, convertMessage(m))
+		list = append(list, b.convertMessage(m))
 	}
 	reply(cmd.ID, map[string]any{"messages": list})
 }
 
 func (b *bridge) sendText(cmd Command) {
+	b.sendInfo(cmd, []*gmproto.MessageInfo{{
+		Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: cmd.Text}},
+	}})
+}
+
+// sendMedia uploads a picture, video or file, then sends it (with any text as its caption).
+func (b *bridge) sendMedia(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(cmd.Data)
+	if err != nil || len(data) == 0 {
+		fail(cmd.ID, "bad_media", errors.New("The file could not be read."))
+		return
+	}
+	media, err := cli.UploadMedia(data, cmd.Name, cmd.Mime)
+	if err != nil {
+		fail(cmd.ID, "upload_failed", err)
+		return
+	}
+	info := []*gmproto.MessageInfo{{Data: &gmproto.MessageInfo_MediaContent{MediaContent: media}}}
+	if cmd.Text != "" {
+		info = append(info, &gmproto.MessageInfo{Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: cmd.Text}}})
+	}
+	b.sendInfo(cmd, info)
+}
+
+func (b *bridge) sendInfo(cmd Command, info []*gmproto.MessageInfo) {
 	cli := b.current()
 	if cli == nil {
 		fail(cmd.ID, "not_connected", nil)
@@ -456,6 +524,10 @@ func (b *bridge) sendText(cmd Command) {
 	}
 	outgoing := conv.GetDefaultOutgoingID()
 	b.mu.Lock()
+	// Another SIM, when the person picked one (dual-SIM phones).
+	if chosen, ok := b.sims[cmd.SIM]; ok && cmd.SIM != "" {
+		outgoing = chosen.GetSIMParticipant().GetID()
+	}
 	sim := b.sims[outgoing]
 	b.mu.Unlock()
 	tmp := fmt.Sprintf("myphone-%d", time.Now().UnixNano())
@@ -466,12 +538,13 @@ func (b *bridge) sendText(cmd Command) {
 			ConversationID: cmd.ConversationID,
 			ParticipantID:  outgoing,
 			TmpID2:         tmp,
-			MessageInfo: []*gmproto.MessageInfo{{
-				Data: &gmproto.MessageInfo_MessageContent{MessageContent: &gmproto.MessageContent{Content: cmd.Text}},
-			}},
+			MessageInfo:    info,
 		},
 		SIMPayload: sim.GetSIMData().GetSIMPayload(),
 		TmpID:      tmp,
+	}
+	if cmd.ReplyTo != "" {
+		req.Reply = &gmproto.ReplyPayload{MessageID: cmd.ReplyTo}
 	}
 	resp, err := cli.SendMessage(b.ctx, req)
 	if err != nil {
@@ -483,6 +556,178 @@ func (b *bridge) sendText(cmd Command) {
 		return
 	}
 	reply(cmd.ID, nil)
+}
+
+// react adds (or, with remove, takes off) an emoji reaction on a message.
+func (b *bridge) react(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	action := gmproto.SendReactionRequest_ADD
+	if cmd.Remove {
+		action = gmproto.SendReactionRequest_REMOVE
+	}
+	b.mu.Lock()
+	var payload *gmproto.SIMPayload
+	if conv := b.convs[cmd.ConversationID]; conv != nil {
+		payload = b.sims[conv.GetDefaultOutgoingID()].GetSIMData().GetSIMPayload()
+	}
+	b.mu.Unlock()
+	resp, err := cli.SendReaction(b.ctx, &gmproto.SendReactionRequest{
+		MessageID:    cmd.MessageID,
+		ReactionData: gmproto.MakeReactionData(cmd.Emoji),
+		Action:       action,
+		SIMPayload:   payload,
+	})
+	if err != nil {
+		fail(cmd.ID, "request_failed", err)
+		return
+	}
+	if !resp.GetSuccess() {
+		fail(cmd.ID, "request_failed", errors.New("Google Messages did not take the reaction."))
+		return
+	}
+	reply(cmd.ID, nil)
+}
+
+// setTyping tells the other people "typing..." (Google Messages stops showing it by itself).
+func (b *bridge) setTyping(cmd Command) {
+	cli := b.current()
+	if cli == nil || !cmd.Typing {
+		reply(cmd.ID, nil)
+		return
+	}
+	b.mu.Lock()
+	var payload *gmproto.SIMPayload
+	if conv := b.convs[cmd.ConversationID]; conv != nil {
+		payload = b.sims[conv.GetDefaultOutgoingID()].GetSIMData().GetSIMPayload()
+	}
+	b.mu.Unlock()
+	if err := cli.SetTyping(b.ctx, cmd.ConversationID, payload); err != nil {
+		fail(cmd.ID, "request_failed", err)
+		return
+	}
+	reply(cmd.ID, nil)
+}
+
+// newChat finds or starts a conversation with one number, or a group (a chat group when
+// Google Messages can, else a group text) with several.
+func (b *bridge) newChat(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	if len(cmd.Numbers) == 0 {
+		fail(cmd.ID, "no_numbers", errors.New("Choose who to message."))
+		return
+	}
+	req := &gmproto.GetOrCreateConversationRequest{}
+	for _, number := range cmd.Numbers {
+		req.Numbers = append(req.Numbers, &gmproto.ContactNumber{MysteriousInt: 2, Number: number, Number2: number})
+	}
+	if len(cmd.Numbers) > 1 && cmd.GroupName != "" {
+		name := cmd.GroupName
+		req.RCSGroupName = &name
+	}
+	resp, err := cli.GetOrCreateConversation(b.ctx, req)
+	if err == nil && resp.GetStatus() == gmproto.GetOrCreateConversationResponse_CREATE_RCS {
+		if req.RCSGroupName == nil {
+			empty := ""
+			req.RCSGroupName = &empty
+		}
+		create := true
+		req.CreateRCSGroup = &create
+		resp, err = cli.GetOrCreateConversation(b.ctx, req)
+	}
+	if err != nil {
+		fail(cmd.ID, "request_failed", err)
+		return
+	}
+	conv := resp.GetConversation()
+	if conv.GetConversationID() == "" {
+		fail(cmd.ID, "request_failed", errors.New("Google Messages did not start the conversation."))
+		return
+	}
+	b.mu.Lock()
+	b.convs[conv.GetConversationID()] = conv
+	b.mu.Unlock()
+	reply(cmd.ID, map[string]any{"conversation": convertConversation(conv)})
+}
+
+// deleteMessage deletes one message, on the phone too.
+func (b *bridge) deleteMessage(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	resp, err := cli.DeleteMessage(b.ctx, cmd.MessageID)
+	if err != nil {
+		fail(cmd.ID, "request_failed", err)
+		return
+	}
+	if !resp.GetSuccess() {
+		fail(cmd.ID, "request_failed", errors.New("Google Messages did not delete it."))
+		return
+	}
+	reply(cmd.ID, nil)
+}
+
+// deleteConversation deletes a whole conversation, on the phone too.
+func (b *bridge) deleteConversation(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	if err := cli.DeleteConversation(b.ctx, cmd.ConversationID, cmd.Phone); err != nil {
+		fail(cmd.ID, "request_failed", err)
+		return
+	}
+	reply(cmd.ID, nil)
+}
+
+// archive moves a conversation to Google Messages' Archived (or, archive false, back to the inbox).
+func (b *bridge) archive(cmd Command) {
+	cli := b.current()
+	if cli == nil {
+		fail(cmd.ID, "not_connected", nil)
+		return
+	}
+	status := gmproto.ConversationStatus_ACTIVE
+	if cmd.Archive {
+		status = gmproto.ConversationStatus_ARCHIVED
+	}
+	resp, err := cli.UpdateConversation(b.ctx, &gmproto.UpdateConversationRequest{
+		ConversationID: cmd.ConversationID,
+		Data: &gmproto.UpdateConversationRequest_UpdateData{UpdateData: &gmproto.UpdateConversationData{
+			ConversationID: cmd.ConversationID,
+			Data:           &gmproto.UpdateConversationData_Status{Status: status},
+		}},
+	})
+	if err != nil {
+		fail(cmd.ID, "request_failed", err)
+		return
+	}
+	if !resp.GetSuccess() {
+		fail(cmd.ID, "request_failed", errors.New("Google Messages did not archive it."))
+		return
+	}
+	reply(cmd.ID, nil)
+}
+
+// simList lists the phone's SIM cards (for choosing one on dual-SIM phones).
+func (b *bridge) simList(cmd Command) {
+	b.mu.Lock()
+	list := make([]SIM, 0, len(b.sims))
+	for id, sim := range b.sims {
+		list = append(list, SIM{ID: id, Carrier: sim.GetSIMData().GetCarrierName(), Number: sim.GetSIMData().GetFormattedPhoneNumber()})
+	}
+	b.mu.Unlock()
+	reply(cmd.ID, map[string]any{"sims": list})
 }
 
 func (b *bridge) markRead(cmd Command) {
@@ -559,11 +804,12 @@ func convertConversation(c *gmproto.Conversation) Conversation {
 		Snippet:       latest.GetDisplayContent(),
 		SnippetFromMe: latest.GetFromMe() == 1,
 		ReadOnly:      c.GetReadOnly(),
+		DefaultSIM:    c.GetDefaultOutgoingID(),
 		Participants:  people,
 	}
 }
 
-func convertMessage(m *gmproto.Message) Message {
+func (b *bridge) convertMessage(m *gmproto.Message) Message {
 	var text []string
 	var media []Media
 	for _, info := range m.GetMessageInfo() {
@@ -580,8 +826,24 @@ func convertMessage(m *gmproto.Message) Message {
 			})
 		}
 	}
+	b.mu.Lock()
+	var reactions []Reaction
+	for _, r := range m.GetReactions() {
+		mine := false
+		for _, id := range r.GetParticipantIDs() {
+			if b.self[id] {
+				mine = true
+			}
+		}
+		if emoji := r.GetData().GetUnicode(); emoji != "" && len(r.GetParticipantIDs()) > 0 {
+			reactions = append(reactions, Reaction{Emoji: emoji, Count: len(r.GetParticipantIDs()), Mine: mine})
+		}
+	}
+	b.mu.Unlock()
 	status := m.GetMessageStatus().GetStatus()
 	return Message{
+		Reactions:      reactions,
+		ReplyTo:        m.GetReplyMessage().GetMessageID(),
 		ID:             m.GetMessageID(),
 		ConversationID: m.GetConversationID(),
 		SenderName:     m.GetSenderParticipant().GetFullName(),
@@ -624,7 +886,8 @@ func main() {
 	log := zerolog.New(zerolog.ConsoleWriter{Out: os.Stderr, NoColor: true}).Level(zerolog.WarnLevel).With().Timestamp().Logger()
 	b := newBridge(log)
 	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Buffer(make([]byte, 1<<20), 16<<20)
+	// Lines carry whole files (base64) for sendMedia: room for about 100 MB.
+	scanner.Buffer(make([]byte, 1<<20), 140<<20)
 	for scanner.Scan() {
 		var cmd Command
 		if err := json.Unmarshal(scanner.Bytes(), &cmd); err != nil {
@@ -642,6 +905,22 @@ func main() {
 			go b.messages(cmd)
 		case "send":
 			go b.sendText(cmd)
+		case "sendMedia":
+			go b.sendMedia(cmd)
+		case "react":
+			go b.react(cmd)
+		case "setTyping":
+			go b.setTyping(cmd)
+		case "newChat":
+			go b.newChat(cmd)
+		case "deleteMessage":
+			go b.deleteMessage(cmd)
+		case "deleteConversation":
+			go b.deleteConversation(cmd)
+		case "archive":
+			go b.archive(cmd)
+		case "sims":
+			b.simList(cmd)
 		case "markRead":
 			go b.markRead(cmd)
 		case "media":

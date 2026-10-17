@@ -20,13 +20,21 @@ Commands (each with a numeric `id`, answered by `{"id":…, "ok":true|false, …
 | `startGoogle` | `cookies` (Google sign-in cookies: SID, HSID, SSID, APISID, SAPISID, OSID, __Secure-1PSIDTS) | `pairing`: true; an `emoji` event follows, to tap on the phone |
 | `conversations` | `limit` | `conversations`: list |
 | `messages` | `conversationId`, `limit` | `messages`: list, oldest last |
-| `send` | `conversationId`, `text` | |
+| `send` | `conversationId`, `text`, optional `replyTo`, `sim` | |
 | `markRead` | `conversationId`, `messageId` | |
 | `media` | `mediaId`, `key` (base64) | `data` (base64) |
+| `sendMedia` | `conversationId`, `data` (base64), `name`, `mime`, optional `text`, `replyTo`, `sim` | |
+| `react` | `conversationId`, `messageId`, `emoji`, `remove` | |
+| `setTyping` | `conversationId` | |
+| `newChat` | `numbers`, optional `groupName` | `conversation` |
+| `deleteMessage` | `messageId` | |
+| `deleteConversation` | `conversationId`, `phone` | |
+| `archive` | `conversationId`, `archive` | |
+| `sims` | | `sims`: the phone's SIM cards |
 | `unpair` | | |
 | `stop` | | |
 
-Events: `qr` (`url` to show as a QR code), `emoji` (`emoji` to tap on the phone when pairing through the Google account), `paired`, `pairFailed`, `session` (keep it, encrypted, to `start` again later), `connected`, `ready`, `conversation`, `message`, `state`, `disconnected`, `unpaired`.
+Events: `qr` (`url` to show as a QR code), `emoji` (`emoji` to tap on the phone when pairing through the Google account), `paired`, `pairFailed`, `session` (keep it, encrypted, to `start` again later), `connected`, `ready`, `conversation`, `message` (with `reactions` and `replyTo`), `typing`, `state`, `disconnected`, `unpaired`.
 
 ## Building
 
