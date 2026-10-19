@@ -79,6 +79,7 @@ type Conversation struct {
 	Snippet       string        `json:"snippet"`
 	SnippetFromMe bool          `json:"snippetFromMe"`
 	ReadOnly      bool          `json:"readOnly"`
+	Archived      bool          `json:"archived"` // in Google Messages' Archived
 	Participants  []Participant `json:"participants"`
 	// The SIM (its participant id) Google Messages sends from in this conversation.
 	DefaultSIM string `json:"defaultSim"`
@@ -443,9 +444,20 @@ func (b *bridge) conversations(cmd Command) {
 		fail(cmd.ID, "request_failed", err)
 		return
 	}
-	list := make([]Conversation, 0, len(resp.GetConversations()))
+	convs := resp.GetConversations()
+	// Archived ones too (marked archived), so they can be listed apart and brought back. Without
+	// them the inbox is still worth answering with.
+	if archived, err := cli.ListConversations(b.ctx, &gmproto.ListConversationsRequest{Count: limit, Folder: gmproto.ListConversationsRequest_ARCHIVE}); err == nil {
+		convs = append(convs, archived.GetConversations()...)
+	}
+	list := make([]Conversation, 0, len(convs))
+	seen := make(map[string]bool, len(convs))
 	b.mu.Lock()
-	for _, c := range resp.GetConversations() {
+	for _, c := range convs {
+		if seen[c.GetConversationID()] {
+			continue
+		}
+		seen[c.GetConversationID()] = true
 		b.convs[c.GetConversationID()] = c
 		list = append(list, convertConversation(c))
 	}
@@ -804,6 +816,7 @@ func convertConversation(c *gmproto.Conversation) Conversation {
 		Snippet:       latest.GetDisplayContent(),
 		SnippetFromMe: latest.GetFromMe() == 1,
 		ReadOnly:      c.GetReadOnly(),
+		Archived:      c.GetStatus() == gmproto.ConversationStatus_ARCHIVED || c.GetStatus() == gmproto.ConversationStatus_KEEP_ARCHIVED,
 		DefaultSIM:    c.GetDefaultOutgoingID(),
 		Participants:  people,
 	}
